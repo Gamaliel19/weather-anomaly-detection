@@ -76,6 +76,39 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_quality_alerts_station_status
             ON quality_alerts(station, active, review_status, date);
 
+        CREATE TABLE IF NOT EXISTS reconstruction_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id INTEGER NOT NULL REFERENCES quality_alerts(id),
+            station TEXT NOT NULL,
+            date TEXT NOT NULL,
+            variable TEXT NOT NULL,
+            original_value REAL,
+            proposed_value REAL NOT NULL,
+            method TEXT NOT NULL,
+            uncertainty REAL,
+            uncertainty_method TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'À examiner',
+            reviewer_comment TEXT,
+            generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            reviewed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_reconstruction_proposals_alert
+            ON reconstruction_proposals(alert_id, generated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS observation_corrections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_id INTEGER NOT NULL REFERENCES reconstruction_proposals(id),
+            station TEXT NOT NULL,
+            date TEXT NOT NULL,
+            variable TEXT NOT NULL,
+            original_value REAL,
+            corrected_value REAL NOT NULL,
+            method TEXT NOT NULL,
+            uncertainty REAL,
+            reviewer_comment TEXT,
+            accepted_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE TABLE IF NOT EXISTS donnees_meteo_imports (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             batch_id    TEXT NOT NULL,
@@ -376,6 +409,127 @@ def update_quality_alert_review(alert_id: int, status: str,
         raise
     finally:
         conn.close()
+
+
+def save_reconstruction_proposal(alert: dict, estimate: dict) -> int:
+    """Append a proposal snapshot; never update source observations."""
+    conn = get_connection()
+    try:
+        cursor = conn.execute("""
+            INSERT INTO reconstruction_proposals (
+                alert_id, station, date, variable, original_value, proposed_value,
+                method, uncertainty, uncertainty_method
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            int(alert["id"]), str(alert["station"]),
+            pd.Timestamp(alert["date"]).strftime("%Y-%m-%d"), str(alert["variable"]),
+            None if pd.isna(alert["observed_value"]) else float(alert["observed_value"]),
+            float(estimate["proposed_value"]), str(estimate["method"]),
+            float(estimate["uncertainty"]), str(estimate["uncertainty_method"]),
+        ))
+        conn.commit()
+        return int(cursor.lastrowid)
+    finally:
+        conn.close()
+
+
+def get_reconstruction_proposals(alert_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    try:
+        return pd.read_sql_query(
+            "SELECT * FROM reconstruction_proposals WHERE alert_id=? ORDER BY id DESC",
+            conn, params=(int(alert_id),),
+        )
+    finally:
+        conn.close()
+
+
+def review_reconstruction_proposal(proposal_id: int, decision: str,
+                                   comment: str = "", corrected_value=None) -> None:
+    """Record a review and, on acceptance, append a separate corrected value."""
+    if decision not in {"Acceptée", "Rejetée"}:
+        raise ValueError("Décision de reconstruction inconnue.")
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN")
+        row = conn.execute(
+            "SELECT * FROM reconstruction_proposals WHERE id=?", (int(proposal_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Proposition introuvable : {proposal_id}")
+        if row["status"] != "À examiner":
+            raise ValueError("Cette proposition a déjà été examinée.")
+        conn.execute("""
+            UPDATE reconstruction_proposals
+            SET status=?, reviewer_comment=?, reviewed_at=datetime('now') WHERE id=?
+        """, (decision, comment.strip() or None, int(proposal_id)))
+        if decision == "Acceptée":
+            value = float(row["proposed_value"] if corrected_value is None else corrected_value)
+            conn.execute("""
+                INSERT INTO observation_corrections (
+                    proposal_id, station, date, variable, original_value,
+                    corrected_value, method, uncertainty, reviewer_comment
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (int(proposal_id), row["station"], row["date"], row["variable"],
+                  row["original_value"], value, row["method"], row["uncertainty"],
+                  comment.strip() or None))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_observation_corrections(station: str = None) -> pd.DataFrame:
+    conn = get_connection()
+    try:
+        query = "SELECT * FROM observation_corrections"
+        params = ()
+        if station:
+            query += " WHERE station=?"
+            params = (station,)
+        return pd.read_sql_query(query + " ORDER BY accepted_at DESC, id DESC", conn, params=params)
+    finally:
+        conn.close()
+
+
+def get_donnees_corrigees(station: str = None) -> pd.DataFrame:
+    """Return a derived dataset applying the latest accepted corrections.
+
+    Each raw weather column is preserved as `<variable>_source`; the standard
+    variable column contains the corrected value where an expert accepted one.
+    """
+    observations = get_donnees(station=station)
+    corrections = get_observation_corrections(station=station)
+    if observations.empty or corrections.empty:
+        return observations
+    corrections = corrections.sort_values(["accepted_at", "id"]).drop_duplicates(
+        ["station", "date", "variable"], keep="last"
+    )
+    corrections["date"] = pd.to_datetime(corrections["date"])
+    result = observations.copy()
+    existing_keys = set(zip(result["station"].astype(str), result["date"].dt.normalize()))
+    missing_rows = []
+    for row in corrections[["station", "date"]].drop_duplicates().itertuples(index=False):
+        key = (str(row.station), pd.Timestamp(row.date).normalize())
+        if key not in existing_keys:
+            new_row = {column: None for column in result.columns}
+            new_row.update({"station": key[0], "date": key[1]})
+            missing_rows.append(new_row)
+    if missing_rows:
+        result = pd.concat([result, pd.DataFrame(missing_rows)], ignore_index=True)
+    for variable in {str(name) for name in corrections["variable"]}:
+        if variable not in result:
+            continue
+        result[f"{variable}_source"] = result[variable]
+        entries = corrections[corrections["variable"] == variable][
+            ["station", "date", "corrected_value"]
+        ].rename(columns={"corrected_value": f"{variable}_accepted"})
+        result = result.merge(entries, on=["station", "date"], how="left")
+        result[variable] = result[f"{variable}_accepted"].combine_first(result[variable])
+        result = result.drop(columns=[f"{variable}_accepted"])
+    return result.sort_values(["station", "date"]).reset_index(drop=True)
 
 
 def get_stations_list() -> list:

@@ -1,8 +1,8 @@
 # Contrôle qualité des observations météorologiques
 
 Prototype de plateforme pour importer des observations météo, repérer des
-anomalies et préparer leur contrôle par les exploitants. La reconstruction
-automatique et sa validation métier restent à développer.
+anomalies et préparer leur contrôle par les exploitants. Les reconstructions
+sont proposées pour revue humaine; elles ne remplacent pas les observations sources.
 
 ## Démarrage
 
@@ -26,7 +26,9 @@ la configuration.
 2. Contrôler les observations par règles explicables et enregistrer la revue des alertes.
 3. Entraîner l'ensemble Isolation Forest, One-Class SVM et Z-score par station.
 4. Détecter et visualiser des observations suspectes.
-5. Exporter un rapport CSV et un résumé textuel.
+5. Comparer des méthodes de reconstruction sur des défauts injectés puis soumettre
+   des propositions à revue humaine.
+6. Exporter un rapport CSV et un résumé textuel.
 
 Les contrôles qualité repèrent les jours et valeurs manquants, les valeurs hors
 bornes physiques configurées, les variations journalières atypiques par rapport
@@ -42,8 +44,30 @@ anomalies labellisées sont exclues de l'ajustement des modèles. Sans labels, l
 seuil suit le taux de contamination configuré. Chaque station conserve ses
 versions de modèle et son pipeline de features. Les scores restent à évaluer
 sur des observations de référence avant usage climatologique. Aucune
-reconstruction ni validation d'une correction par un expert n'est encore
-proposée.
+reconstruction n'est appliquée sans validation d'un spécialiste.
+
+## Reconstruction et corrections
+
+Pour une alerte sélectionnée, la plateforme peut proposer une interpolation
+temporelle locale sur une lacune courte, avec une médiane des observations du
+même mois comme solution de repli. L'incertitude affichée est une estimation
+robuste exploratoire, pas un intervalle probabiliste validé. La méthode est
+station-locale et la reconstruction peut utiliser les observations avant et
+après la date cible; elle convient donc à la reprise de séries historiques,
+pas au remplacement temps réel d'une mesure. La pluie est volontairement
+exclue de cette méthode générique : ses cumuls intermittents nécessitent une
+méthode dédiée, idéalement étayée par les stations voisines.
+
+Chaque calcul crée un instantané de proposition traçable. Le spécialiste peut
+accepter la valeur suggérée, la modifier ou la rejeter, avec commentaire. Les
+propositions et corrections acceptées sont stockées dans des tables distinctes;
+`donnees_meteo` et l'historique des imports ne sont jamais écrasés. Les systèmes
+aval peuvent demander le jeu dérivé via `get_donnees_corrigees`, qui conserve les
+colonnes `*_source` pour les variables corrigées. Les méthodes se comparent sur
+les valeurs de référence connues avec `evaluate_reconstruction_methods`; une
+validation métier sur des séries de référence tchadiennes reste indispensable.
+Cette comparaison est une fonction de benchmark; elle n'est pas encore exposée
+comme un tableau de bord dans l'interface.
 
 ## Contrat d'import actuel
 

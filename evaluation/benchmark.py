@@ -546,3 +546,23 @@ def evaluate_reconstruction(benchmark: BenchmarkDataset,
         by_fault_type=grouped_regression("fault_type"),
         by_gap_length=grouped_regression("gap_length"),
     )
+
+
+def evaluate_reconstruction_methods(benchmark: BenchmarkDataset,
+                                    max_interpolation_gap: int = 3) -> dict:
+    """Compare local interpolation and same-month median on injected faults.
+
+    Metrics are computed only against the benchmark's hidden reference truth.
+    """
+    from reconstruction.methods import compare_reconstruction_methods
+
+    estimates = compare_reconstruction_methods(benchmark, max_interpolation_gap)
+    if estimates.empty:
+        return {}
+    results = {}
+    for method, method_estimates in estimates.groupby("method", sort=True):
+        results[method] = evaluate_reconstruction(
+            benchmark,
+            method_estimates.drop(columns="method").reset_index(drop=True),
+        )
+    return results

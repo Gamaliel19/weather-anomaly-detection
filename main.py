@@ -14,10 +14,13 @@ from config import VARIABLES, STATIONS, PHYSICAL_BOUNDS, MODEL_PARAMS, MODEL_DIR
 from database.db import (init_db, insert_donnees, get_donnees,
                           save_anomalies, get_anomalies, get_stations_list,
                           save_model_info, sync_quality_alerts,
-                          get_quality_alerts, update_quality_alert_review)
+                          get_quality_alerts, update_quality_alert_review,
+                          save_reconstruction_proposal, get_reconstruction_proposals,
+                          review_reconstruction_proposal, get_observation_corrections)
 from data.synthetic_generator import generate_station_data, generate_all_stations
 from data.contract import validate_observations
 from quality.control import run_quality_checks
+from reconstruction.methods import reconstruct_station_value
 from preprocessing.pipeline import FeaturePipeline
 from models.ensemble_detector import SahelianAnomalyDetector, station_slug
 from evaluation.benchmark import model_selection_split, binary_classification_metrics
@@ -351,6 +354,96 @@ elif page == " Contrôle qualité":
                     except Exception as e:
                         st.error(f"La décision n'a pas pu être enregistrée : {e}")
 
+                st.divider()
+                st.markdown("**Proposition de reconstruction**")
+                reconstructable = alert["rule"] in {
+                    "missing_day", "missing_value", "physical_bounds",
+                    "abrupt_change", "stuck_sensor",
+                } and (alert["rule"] == "missing_day" or alert["variable"] != "pluie")
+                target_variables = (
+                    [variable for variable in VARS if variable != "pluie"]
+                    if alert["rule"] == "missing_day" else [alert["variable"]]
+                )
+                if reconstructable:
+                    st.caption(
+                        "L'estimation utilise uniquement l'historique de cette station. "
+                        "Elle reste une proposition; la valeur source ne sera pas remplacée."
+                    )
+                    if alert["rule"] == "missing_day" or alert["variable"] == "pluie":
+                        st.info(
+                            "La pluie n'est pas reconstruite par interpolation générique : "
+                            "une méthode dédiée aux cumuls intermittents et aux références spatiales reste à valider."
+                        )
+                    for target_variable in target_variables:
+                        label = VARIABLES[target_variable]["label"]
+                        if st.button(
+                            f"Calculer · {label}",
+                            key=f"reconstruct_{int(alert['id'])}_{target_variable}",
+                        ):
+                            try:
+                                estimate = reconstruct_station_value(
+                                    qc_data, target_variable, alert["date"]
+                                )
+                                proposal_alert = alert.to_dict()
+                                proposal_alert["variable"] = target_variable
+                                proposal_alert["observed_value"] = (
+                                    None if alert["rule"] == "missing_day"
+                                    else alert["observed_value"]
+                                )
+                                proposal_id = save_reconstruction_proposal(proposal_alert, estimate)
+                                st.success(f"Proposition enregistrée · n° {proposal_id}")
+                            except Exception as e:
+                                st.warning(f"Reconstruction indisponible pour {label} : {e}")
+                        proposals = get_reconstruction_proposals(int(alert["id"]))
+                        if not proposals.empty:
+                            proposals = proposals[proposals["variable"] == target_variable]
+                        if not proposals.empty:
+                            proposal = proposals.iloc[0]
+                            st.write(
+                                f"{label} · {proposal['proposed_value']:.3f} "
+                                f"± {proposal['uncertainty']:.3f} · {proposal['method']} · "
+                                f"{proposal['status']}"
+                            )
+                            st.caption(proposal["uncertainty_method"])
+                            if proposal["status"] == "À examiner":
+                                with st.form(f"review_reconstruction_{int(proposal['id'])}"):
+                                    decision = st.radio(
+                                        "Décision sur cette estimation",
+                                        ["Acceptée", "Rejetée"], horizontal=True,
+                                    )
+                                    edited_value = st.number_input(
+                                        f"Valeur retenue ({VARIABLES[target_variable]['unit']})",
+                                        value=float(proposal["proposed_value"]),
+                                    )
+                                    reconstruction_comment = st.text_area(
+                                        "Justification du spécialiste",
+                                        key=f"reconstruction_comment_{int(proposal['id'])}",
+                                    )
+                                    submit_decision = st.form_submit_button(
+                                        "Enregistrer la décision", type="primary"
+                                    )
+                                if submit_decision:
+                                    try:
+                                        review_reconstruction_proposal(
+                                            int(proposal["id"]), decision,
+                                            reconstruction_comment,
+                                            edited_value if decision == "Acceptée" else None,
+                                        )
+                                        st.success(
+                                            "Décision enregistrée. La correction acceptée est "
+                                            "conservée séparément des observations importées."
+                                        )
+                                    except Exception as e:
+                                        st.error(f"La décision n'a pas pu être enregistrée : {e}")
+                else:
+                    if alert["variable"] == "pluie":
+                        st.info(
+                            "La pluie n'est pas reconstruite par interpolation générique : "
+                            "une méthode dédiée aux cumuls intermittents et aux références spatiales reste à valider."
+                        )
+                    else:
+                        st.info("Aucune méthode de reconstruction n'est proposée pour cette règle.")
+
     with st.expander("Règles appliquées"):
         st.markdown(
             "- **Jour manquant** : date absente entre la première et la dernière observation de la période.\n"
@@ -364,6 +457,17 @@ elif page == " Contrôle qualité":
             "du service météo avant un usage opérationnel. Une alerte est un signal à examiner, "
             "pas une correction automatique."
         )
+
+    with st.expander("Corrections acceptées — historique séparé"):
+        accepted_corrections = get_observation_corrections(selected_station)
+        if accepted_corrections.empty:
+            st.info("Aucune correction n'a encore été acceptée.")
+        else:
+            st.dataframe(
+                accepted_corrections,
+                hide_index=True,
+                alt="Historique des valeurs reconstruites et acceptées par un spécialiste",
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
