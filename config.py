@@ -66,14 +66,22 @@ SEVERITY_THRESHOLDS = {
 ROLLING_WINDOWS = [3, 7, 14]
 LAG_DAYS        = [1, 3, 7]
 
+# ─── Contrôles qualité déterministes ────────────────────────────────────────
+QUALITY_RULES = {
+    "min_daily_changes": 30,
+    "change_mad_multiplier": 6.0,
+    "stuck_run_days": 7,
+    # Une séquence de pluie nulle est fréquente en saison sèche ; ne pas la
+    # confondre avec un capteur figé.
+    "stuck_sensor_variables": ["temperature", "humidite", "pression", "vent", "rayonnement"],
+}
+QUALITY_REVIEW_STATUSES = ["À examiner", "Confirmée", "Faux positif"]
+
 # ─── Chemins ─────────────────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 DB_PATH    = os.path.join(BASE_DIR, "data", "meteo_sahelien.db")
 MODEL_DIR  = os.path.join(BASE_DIR, "models", "saved")
 REPORT_DIR = os.path.join(BASE_DIR, "reports", "output")
-
-os.makedirs(MODEL_DIR,  exist_ok=True)
-os.makedirs(REPORT_DIR, exist_ok=True)
 
 # ─── Stations de démonstration ───────────────────────────────────────────────
 STATIONS = {
